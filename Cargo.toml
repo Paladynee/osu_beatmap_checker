@@ -67,3 +67,4 @@ non_ascii_idents = "warn"
 
 [dependencies]
 anyhow = "1.0.95"
+voxell_timer = "1.1.1"

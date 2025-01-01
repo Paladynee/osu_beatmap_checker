@@ -13,4 +13,11 @@ name = "osumapchecker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "voxell_timer",
 ]
+
+[[package]]
+name = "voxell_timer"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9497078d1191cd08047622361a0cb3fef02e9b0bbc1eab7c4684cc3c6fea0a4f"

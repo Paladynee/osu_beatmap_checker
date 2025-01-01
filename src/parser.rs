@@ -29,6 +29,36 @@ pub struct BeatmapParser<'source> {
     pub(crate) section: Section,
 }
 
+/// # Safety
+///
+/// The byte slice must be valid utf-8.
+unsafe trait ConvertByteSliceToStrSlice<'a> {
+    /// # Safety
+    ///
+    /// The byte slice must be valid utf-8.
+    unsafe fn convert_byte_slice_to_str_slice(self) -> &'a str;
+
+    /// # Safety
+    ///
+    /// The byte slice must be valid utf-8.
+    unsafe fn convert_byte_slice_to_string(self) -> String;
+}
+
+unsafe impl<'a> ConvertByteSliceToStrSlice<'a> for &'a [u8] {
+    #[inline]
+    unsafe fn convert_byte_slice_to_str_slice(self) -> &'a str {
+        // str::from_utf8(self).context("converting u8 slice to string").unwrap()
+        unsafe { str::from_utf8_unchecked(self) }
+    }
+
+    #[inline]
+    unsafe fn convert_byte_slice_to_string(self) -> String {
+        let v = self.to_vec();
+        unsafe { String::from_utf8_unchecked(v) }
+        // String::from_utf8(v).context("converting u8 slice to string").unwrap()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     Beginning,
@@ -109,20 +139,26 @@ macro_rules! write_loop_impl {
             while !self.is_at_end() {
                 self.start = self.index;
 
-                self.print_info(&format!("SECTION {}", self.section));
+                // self.print_info(&format!("SECTION {} in {}", self.section, stringify!($fn_name)));
                 // Safety: the while loop condition guarantees that we are not at the end
                 let ret = unsafe { self.$parse_fn_name() };
 
                 match ret {
-                    ParserControlFlow::Continue => {
+                    ParserControlFlow::ChangeParseLoop => {
+                        return ParserControlFlow::ChangeParseLoop;
+                    }
+
+                    ParserControlFlow::ContinueParseLoop => {
                         continue;
                     }
 
-                    other => return other,
+                    ParserControlFlow::ParserFinished => {
+                        return ParserControlFlow::ParserFinished;
+                    }
                 };
             }
 
-            ParserControlFlow::Finished
+            ParserControlFlow::ParserFinished
         }
     };
 }
@@ -138,10 +174,15 @@ impl<'source> BeatmapParser<'source> {
     #[track_caller]
     pub(crate) unsafe fn advance(&mut self) -> u8 {
         debug_assert!(self.index < self.source.len(), "len is {} but index is {}", self.source.len(), self.index);
-        let current = unsafe { self.source.get_unchecked(self.index) };
+        let current = unsafe { *self.source.get_unchecked(self.index) };
+        // if current == b'\n' {
+        //     self.line += 1;
+        //     self.column = 0;
+        // } else {
+        //     self.column += 1;
+        // }
         self.index += 1;
-        self.column += 1;
-        *current
+        current
     }
 
     /// Consumes the current character if it matches the expected character.
@@ -196,18 +237,20 @@ impl<'source> BeatmapParser<'source> {
         }
     }
 
+    /// Disabled for performance.
     #[inline]
-    pub(crate) fn print_info(&self, message: &str) {
-        if self.mode == ParserMode::Verbose {
-            eprintln!("INFO {},{}: {}", self.line, self.column, message);
-        }
+    pub(crate) const fn print_info(&self, message: &str) {
+        // if self.mode == ParserMode::Verbose {
+        //     eprintln!("INFO {},{}: {}", self.line, self.column, message);
+        // }
     }
 
     /// Pushes the given item into the items vector. The source is automatically
     /// sliced using the start and index fields.
     #[inline]
     pub(crate) fn push_item(&mut self, item: Item<'source>) {
-        let source = &self.source[self.start..self.index];
+        let source_slice = &self.source[self.start..self.index];
+        let source = unsafe { source_slice.convert_byte_slice_to_str_slice() };
         let debug_item = DebugItem { source, item };
         self.items.push(debug_item);
     }
@@ -223,7 +266,7 @@ impl<'source> BeatmapParser<'source> {
                 break;
             }
 
-            if !c.is_ascii_digit() {
+            if c != b'-' && !c.is_ascii_digit() {
                 break;
             }
 
@@ -232,12 +275,10 @@ impl<'source> BeatmapParser<'source> {
         }
 
         let integer_str = &self.source[self.start..self.index];
-        let integer = str::from_utf8(integer_str)
-            .context("converting integer byteslice to string")
-            .unwrap()
-            .parse::<usize>()
-            .context("parsing integer")
-            .unwrap();
+        let Ok(integer) = unsafe { integer_str.convert_byte_slice_to_str_slice() }.parse::<isize>() else {
+            self.print_error_with_context("parsing integer");
+            return;
+        };
         self.push_item(Item::Integer(integer));
     }
 
@@ -257,12 +298,10 @@ impl<'source> BeatmapParser<'source> {
         }
 
         let float_str = &self.source[self.start..self.index];
-        let float = str::from_utf8(float_str)
-            .context("converting float byteslice to string")
-            .unwrap()
-            .parse::<f64>()
-            .context("parsing float")
-            .unwrap();
+        let Ok(float) = unsafe { float_str.convert_byte_slice_to_str_slice() }.parse::<f64>() else {
+            self.print_error_with_context("parsing float");
+            return;
+        };
         self.push_item(Item::Float(float));
     }
 
@@ -283,7 +322,7 @@ impl<'source> BeatmapParser<'source> {
 
         // do not include the newline character if it is the last character
         // todo: check if this works with `:`, `[`, `,`, and `"` too
-        let literal = if !self.is_at_end() && {
+        let literal_slice = if !self.is_at_end() && {
             // Safety: control flow of the `&&` operator guarantees that we are not at the end
             unsafe { self.peek() }
         } == b'\n'
@@ -293,6 +332,7 @@ impl<'source> BeatmapParser<'source> {
             &self.source[self.start..self.index]
         };
 
+        let literal = unsafe { literal_slice.convert_byte_slice_to_str_slice() };
         self.push_item(Item::Literal(literal));
     }
 
@@ -325,14 +365,16 @@ impl<'source> BeatmapParser<'source> {
         // Safety: we early returned if we were at the end
         unsafe { self.advance() };
 
-        let section_header_str = &self.source[self.start..self.index];
-        let header_string = String::from_utf8(section_header_str.to_vec())
-            .context("converting header string byteslice to string")
-            .unwrap();
+        let section_header_slice = &self.source[self.start..self.index];
+        let section_header_string = section_header_slice.to_vec();
+        let header_string = unsafe { section_header_string.convert_byte_slice_to_string() };
         let section = Section::from_header(&header_string);
         if let Some(sect) = section {
             self.push_item(Item::SectionHeader(sect));
-        };
+        } else {
+            let unkstr = unsafe { section_header_slice.convert_byte_slice_to_str_slice() };
+            self.push_item(Item::UnknownSectionHeader(unkstr));
+        }
         section
     }
 
@@ -362,13 +404,15 @@ impl<'source> BeatmapParser<'source> {
             return;
         };
 
-        let quoted_string = &self.source[self.start..self.index];
+        let quoted_string_slice = &self.source[self.start..self.index];
 
         // Consume the ending quote
         // Safety: we early returned if we were at the end
         unsafe { self.advance() };
 
-        self.push_item(Item::QuotedString(quoted_string));
+        let quoted_string_str = unsafe { quoted_string_slice.convert_byte_slice_to_str_slice() };
+
+        self.push_item(Item::QuotedString(quoted_string_str));
     }
 
     /// Parses a value after a colon until the next newline character.
@@ -386,8 +430,23 @@ impl<'source> BeatmapParser<'source> {
             unsafe { self.advance() };
         }
 
-        let value = &self.source[self.start..self.index];
-        self.push_item(Item::ValueUntilNewline(value));
+        let value_slice = if self.start == self.index {
+            &self.source[self.start..self.start]
+        } else {
+            &self.source[self.start..self.index]
+        };
+
+        // Consume the newline character(s)
+        // Safety: we early returned if we were at the end
+        if !self.is_at_end() && unsafe { self.peek() } == b'\r' {
+            unsafe { self.advance() };
+        }
+        if !self.is_at_end() && unsafe { self.peek() } == b'\n' {
+            unsafe { self.advance() };
+        }
+
+        let value_str = unsafe { value_slice.convert_byte_slice_to_str_slice() };
+        self.push_item(Item::ValueUntilNewline(value_str));
     }
 
     /// Parse a single hit object.
@@ -532,6 +591,8 @@ impl<'source> BeatmapParser<'source> {
                     self.print_error_with_context("unknown section header");
                     self.section = Section::OnlySectionHeaders;
                 };
+
+                return ParserControlFlow::ChangeParseLoop;
             }
 
             b'o' => {
@@ -563,7 +624,7 @@ impl<'source> BeatmapParser<'source> {
             }
         };
 
-        ParserControlFlow::Continue
+        ParserControlFlow::ContinueParseLoop
     }
 
     /// Parsing logic that ignores everything but section headers.
@@ -576,18 +637,25 @@ impl<'source> BeatmapParser<'source> {
         // Safety: caller upholds the contract
         let c = unsafe { self.advance() };
 
-        if c == b'[' {
-            if let Some(section) = self.parse_section_header() {
-                self.section = section;
-            } else {
-                self.print_error_with_context("unknown section header");
-                self.section = Section::OnlySectionHeaders;
-            };
-        } else {
-            // ignore everything else
-        };
+        #[allow(clippy::single_match_else)]
+        match c {
+            b'[' => {
+                if let Some(section) = self.parse_section_header() {
+                    self.section = section;
+                } else {
+                    self.print_error_with_context("unknown section header");
+                    self.section = Section::OnlySectionHeaders;
+                };
+                return ParserControlFlow::ChangeParseLoop;
+            }
 
-        ParserControlFlow::Continue
+            _ => {
+                // ignore everything else
+                self.parse_until_newline();
+                self.start = self.index;
+            }
+        }
+        ParserControlFlow::ContinueParseLoop
     }
 
     /// Parsing logic that ignores everything but section headers.
@@ -608,6 +676,7 @@ impl<'source> BeatmapParser<'source> {
                     self.print_error_with_context("unknown section header");
                     self.section = Section::OnlySectionHeaders;
                 };
+                return ParserControlFlow::ChangeParseLoop;
             }
 
             b'\r' => {
@@ -629,7 +698,7 @@ impl<'source> BeatmapParser<'source> {
                 self.push_item(Item::Colon);
                 if self.is_at_end() {
                     self.print_error_with_context("end of file after colon");
-                    return ParserControlFlow::Finished;
+                    return ParserControlFlow::ParserFinished;
                 }
 
                 // Safety: we have just checked that we are not at the end
@@ -643,7 +712,7 @@ impl<'source> BeatmapParser<'source> {
             }
         };
 
-        ParserControlFlow::Continue
+        ParserControlFlow::ContinueParseLoop
     }
 
     /// Parse the next item in the source.
@@ -674,6 +743,7 @@ impl<'source> BeatmapParser<'source> {
                     self.print_error_with_context("unknown section header");
                     self.section = Section::OnlySectionHeaders;
                 };
+                return ParserControlFlow::ChangeParseLoop;
             }
 
             _ => {
@@ -681,7 +751,7 @@ impl<'source> BeatmapParser<'source> {
             }
         };
 
-        ParserControlFlow::Continue
+        ParserControlFlow::ContinueParseLoop
     }
 
     /// Parse the next item in the source.
@@ -712,6 +782,7 @@ impl<'source> BeatmapParser<'source> {
                     self.print_error_with_context("unknown section header");
                     self.section = Section::OnlySectionHeaders;
                 };
+                return ParserControlFlow::ChangeParseLoop;
             }
 
             _ => {
@@ -719,7 +790,7 @@ impl<'source> BeatmapParser<'source> {
             }
         };
 
-        ParserControlFlow::Continue
+        ParserControlFlow::ContinueParseLoop
     }
 
     // /// Parse the next item in the source.
@@ -813,11 +884,11 @@ impl<'source> BeatmapParser<'source> {
             };
 
             match res {
-                ParserControlFlow::Continue => {
+                ParserControlFlow::ContinueParseLoop | ParserControlFlow::ChangeParseLoop => {
                     continue;
                 }
 
-                ParserControlFlow::Finished => {
+                ParserControlFlow::ParserFinished => {
                     break;
                 }
             }
@@ -827,10 +898,10 @@ impl<'source> BeatmapParser<'source> {
     /// Construct a new parser with the given source and mode.
     #[inline]
     #[must_use = "the parser is lazy and does not parse until you call [`BeatmapParser::parse`]."]
-    pub const fn new(source: &'source str, mode: ParserMode) -> Self {
+    pub fn new(source: &'source str, mode: ParserMode) -> Self {
         Self {
             source: source.as_bytes(),
-            items: Vec::new(),
+            items: Vec::with_capacity(/* hint */ source.len() / 6),
             mode,
             start: 0,
             index: 0,
@@ -843,6 +914,7 @@ impl<'source> BeatmapParser<'source> {
     /// Parse the source into a vector of items. This function consumes the parser.
     #[inline]
     #[must_use]
+    #[no_mangle]
     pub fn parse(mut self) -> Vec<Item<'source>> {
         self.parse_generic();
         self.items.into_iter().map(|item| item.item).collect()
@@ -859,27 +931,47 @@ impl<'source> BeatmapParser<'source> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ParserControlFlow {
-    Finished,
-    Continue,
+    ParserFinished,
+    ChangeParseLoop,
+    ContinueParseLoop,
 }
 
 /// An item with the source annotated.
 #[derive(Debug)]
 pub struct DebugItem<'source> {
-    pub source: &'source [u8],
+    pub source: &'source str,
     pub item: Item<'source>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 pub enum Item<'source> {
     Comma,
     Colon,
     Newline,
     FileFormatMagic,
-    Literal(&'source [u8]),
-    Integer(usize),
+    Literal(&'source str),
+    Integer(isize),
     Float(f64),
-    QuotedString(&'source [u8]),
-    ValueUntilNewline(&'source [u8]),
+    QuotedString(&'source str),
+    ValueUntilNewline(&'source str),
     SectionHeader(Section),
+    UnknownSectionHeader(&'source str),
+}
+
+impl Debug for Item<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Comma => write!(f, "Comma"),
+            Self::Colon => write!(f, "Colon"),
+            Self::Newline => write!(f, "Newline"),
+            Self::FileFormatMagic => write!(f, "FileFormatMagic"),
+            Self::Literal(lit) => write!(f, "Literal({:?})", lit),
+            Self::Integer(int) => write!(f, "Integer({:?})", int),
+            Self::Float(float) => write!(f, "Float({:?})", float),
+            Self::QuotedString(quoted) => write!(f, "QuotedString({:?})", quoted),
+            Self::ValueUntilNewline(value) => write!(f, "ValueUntilNewline({:?})", value),
+            Self::SectionHeader(section) => write!(f, "SectionHeader({:?})", section),
+            Self::UnknownSectionHeader(unk) => write!(f, "UnknownSectionHeader({:?})", unk),
+        }
+    }
 }

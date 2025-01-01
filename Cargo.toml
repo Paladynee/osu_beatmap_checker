@@ -1,7 +1,21 @@
 [package]
+edition = "2021"
 name = "osumapchecker"
 version = "0.1.0"
-edition = "2021"
+
+[dependencies]
+anyhow = "1.0.95"
+voxell_timer = "1.1.1"
+
+[profile.release]
+codegen-units = 1
+debug = true
+debug-assertions = false
+incremental = false
+lto = true
+overflow-checks = false
+panic = "unwind"
+strip = true
 
 [lints.clippy]
 absolute_paths = "warn"
@@ -64,7 +78,3 @@ unreadable_literal = "allow"
 [lints.rust]
 ambiguous_negative_literals = "warn"
 non_ascii_idents = "warn"
-
-[dependencies]
-anyhow = "1.0.95"
-voxell_timer = "1.1.1"

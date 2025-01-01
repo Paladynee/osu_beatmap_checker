@@ -97,6 +97,12 @@ macro_rules! write_test_fn_for_filename {
                                 .context("writing to file")?;
                         }
 
+                        Item::UnknownSectionHeader(lit) => {
+                            writer
+                                .write_all(format!("{:?} => UnknownSectionHeader({:?})\n", src.qs(), lit.qs()).as_bytes())
+                                .context("writing to file")?;
+                        }
+
                         Item::Newline => {
                             writer
                                 .write_all(format!("{:?} => Newline\n", src.qs()).as_bytes())
